@@ -63,24 +63,69 @@ func (s *Server) bindOptionalContractConsumer(ctx context.Context, req mcp.CallT
 		}
 	}
 	epoch := s.contractAnalysisRuntime.InputEpoch()
-	opened, pending, openErr := s.openContractConsumerBinding(ctx, selected, checkout, repos)
 	adopt := func(opened *contractAnalysisContext) {
 		// Transfer only resource ownership into the existing deferred placeholder;
 		// no mutex/Once is copied, and no local-only context replacement is used.
-		binding.views, binding.releaseCohort = opened.views, opened.releaseCohort
+		binding.views, binding.releaseCohort, binding.cohortOf = opened.views, opened.releaseCohort, opened.cohortOf
 		binding.served = status.allowServed
 		binding.recovered = opened.recovered
 		status.receiptsUnknown = opened.recovered
 		opened.views, opened.releaseCohort = nil, nil
 	}
-	if openErr == nil {
-		adopt(opened)
+	groups := s.contractConsumerGroups(repos, nil, selected != nil || checkout != "")
+	var siblings []indexer.ContractActor
+	if len(groups) > 1 {
+		siblings = contractGroupActors(checkout, groups)
+	}
+	// Every group is opened, and every pending one scheduled, before any is
+	// found missing.
+	parts := make([]*contractAnalysisContext, len(groups))
+	fresh := true
+	var openErr error
+	for i, group := range groups {
+		opened, current, groupErr, err := s.optionalContractCohort(ctx, status, selected, checkout, group, epoch, siblings)
+		if err != nil {
+			for _, part := range parts {
+				part.close()
+			}
+			return err
+		}
+		parts[i], fresh = opened, fresh && current
+		if opened == nil && openErr == nil {
+			openErr = groupErr
+		}
+	}
+	if openErr != nil {
+		for _, part := range parts {
+			part.close()
+		}
+		return missing(openErr)
+	}
+	opened := parts[0]
+	if len(parts) > 1 {
+		opened = mergeContractGroupBindings(parts, &s.contractRegistries)
+	}
+	adopt(opened)
+	if fresh {
 		status.state, status.reason, status.fresh = graphview.StateComplete, "", true
 		status.retryAfter = 0
 		return nil
 	}
+	status.state, status.reason, status.fresh = graphview.StateBuilding, "contract_analysis_pending", false
+	return nil
+}
+
+// optionalContractCohort opens one cohort's current analysis; otherwise it
+// records interest in it and opens its served predecessor. fresh reports a
+// current view; a nil binding returns the open error; err is the caller's
+// cancellation.
+func (s *Server) optionalContractCohort(ctx context.Context, status *contractConsumerStatus, selected *graphview.RepoView, checkout string, repos []string, epoch uint64, siblings []indexer.ContractActor) (binding *contractAnalysisContext, fresh bool, openErr, err error) {
+	opened, pending, openErr := s.openContractConsumerBinding(ctx, selected, checkout, repos)
+	if openErr == nil {
+		return opened, true, nil, nil
+	}
 	if err := ctx.Err(); err != nil {
-		return err
+		return nil, false, openErr, err
 	}
 	actor := indexer.NewContractActor(checkout, repos)
 	// Schedule owns the prepared source on every return, including queue-full.
@@ -88,7 +133,7 @@ func (s *Server) bindOptionalContractConsumer(ctx context.Context, req mcp.CallT
 	if pending != nil {
 		source, sourceErr := indexer.PrepareContractCaptureSource(selected)
 		if sourceErr == nil {
-			_, scheduleErr := s.contractAnalysisRuntime.Schedule(ctx, indexer.ContractScheduleRequest{Actor: actor, Key: pending.key, Inputs: pending.inputs, Source: source, Epoch: epoch})
+			_, scheduleErr := s.contractAnalysisRuntime.Schedule(ctx, indexer.ContractScheduleRequest{Actor: actor, Key: pending.key, Inputs: pending.inputs, Source: source, Epoch: epoch, Siblings: siblings})
 			var full *indexer.ContractQueueFullError
 			if errors.As(scheduleErr, &full) {
 				status.retryAfter = full.RetryAfter
@@ -96,17 +141,15 @@ func (s *Server) bindOptionalContractConsumer(ctx context.Context, req mcp.CallT
 		}
 	}
 	if err := ctx.Err(); err != nil {
-		return err
+		return nil, false, openErr, err
 	}
 	if status.allowServed && s.contractAnalysisRuntime.AcquireLastPublishedCohort != nil {
 		previous, _, previousErr := s.openContractPredecessorBinding(ctx, selected, checkout, repos, actor)
 		if previousErr == nil {
-			adopt(previous)
-			status.state, status.reason, status.fresh = graphview.StateBuilding, "contract_analysis_pending", false
-			return nil
+			return previous, false, nil, nil
 		}
 	}
-	return missing(openErr)
+	return nil, false, openErr, nil
 }
 
 func optionalContractWarning(status *contractConsumerStatus) string {

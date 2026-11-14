@@ -4247,6 +4247,10 @@ func (mi *MultiIndexer) attachInlinedShapes(cr *contracts.Registry, g graph.Stor
 							if n.Kind != graph.KindType && n.Kind != graph.KindInterface {
 								continue
 							}
+							// Callers hold mi.mu (read).
+							if !mi.contractTypeVisibleLocked(n, items[i].RepoPrefix) {
+								continue
+							}
 							resolved = n.ID
 							resolvedNodes[n.ID] = n
 							if items[i].RepoPrefix != "" && strings.HasPrefix(n.ID, items[i].RepoPrefix+"/") {
@@ -4495,33 +4499,7 @@ func (mi *MultiIndexer) ReconcileContractEdges() int {
 		for name := range bareTypeNames {
 			names = append(names, name)
 		}
-		matchesByName := mi.graph.FindNodesByNames(names)
-		lookup := func(name, repoHint string) []string {
-			matches := matchesByName[name]
-			if len(matches) == 0 {
-				return nil
-			}
-			ids := make([]string, 0, len(matches))
-			for _, n := range matches {
-				if n.Kind != graph.KindType && n.Kind != graph.KindInterface {
-					continue
-				}
-				ids = append(ids, n.ID)
-			}
-			// Prefer same-repo when multiple match.
-			if len(ids) > 1 && repoHint != "" {
-				var sameRepo []string
-				for _, id := range ids {
-					if strings.HasPrefix(id, repoHint+"/") {
-						sameRepo = append(sameRepo, id)
-					}
-				}
-				if len(sameRepo) > 0 {
-					return sameRepo
-				}
-			}
-			return ids
-		}
+		lookup := mi.contractTypeLookupLocked(mi.graph.FindNodesByNames(names))
 		for _, cr := range registries {
 			cr.UpgradeBareTypeRefs(lookup)
 		}

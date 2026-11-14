@@ -1511,13 +1511,19 @@ func (r *contractPinnedReader) read(path string) ([]byte, error) {
 // indexers builds one analysis-only Indexer per repository over evidence.
 func (c *contractConvergence) indexers(evidence *contractFollowupEvidence, read func(string) ([]byte, error)) map[string]*Indexer {
 	out := make(map[string]*Indexer)
+	workspaces := make(map[string]string)
+	for _, file := range c.files {
+		if file.WorkspaceID != "" {
+			workspaces[file.RepoPrefix] = file.WorkspaceID
+		}
+	}
 	add := func(repo, workspace, project string) {
 		cfg := c.req.Config
 		if override, ok := c.req.RepoConfigs[repo]; ok {
 			cfg = override
 		}
 		root := filepath.Join(string(filepath.Separator), "contract-followup", repo)
-		idx := &Indexer{contractHandlerCandidates: evidence.contractHandlerDeclarations, contractProviderValue: c.ownedProviderSchema, contractProviderObserved: c.rememberProviderSchema, contractBindingValue: c.ownedBodyBinding, contractBindingObserved: c.rememberBodyBinding, graph: evidence, rootPath: root, repoPrefix: repo, workspaceID: workspace, projectID: project, config: cfg, logger: c.logger, registry: c.req.Registry}
+		idx := &Indexer{contractHandlerCandidates: evidence.contractHandlerDeclarations, contractRepoWorkspaces: workspaces, contractProviderValue: c.ownedProviderSchema, contractProviderObserved: c.rememberProviderSchema, contractBindingValue: c.ownedBodyBinding, contractBindingObserved: c.rememberBodyBinding, graph: evidence, rootPath: root, repoPrefix: repo, workspaceID: workspace, projectID: project, config: cfg, logger: c.logger, registry: c.req.Registry}
 		opts := c.snap.RepoExtractionOptions[repo]
 		idx.extractionOptions.Store(&opts)
 		idx.contractAnalysisOnly = true
@@ -1542,7 +1548,7 @@ func (c *contractConvergence) indexers(evidence *contractFollowupEvidence, read 
 	// A certified empty own namespace still receives a complete empty snapshot.
 	if out[c.snap.Key.RepoPrefix] == nil {
 		cfg := c.req.Config
-		idx := &Indexer{contractHandlerCandidates: evidence.contractHandlerDeclarations, contractProviderValue: c.ownedProviderSchema, contractProviderObserved: c.rememberProviderSchema, contractBindingValue: c.ownedBodyBinding, contractBindingObserved: c.rememberBodyBinding, graph: evidence, rootPath: "/contract-followup", repoPrefix: c.snap.Key.RepoPrefix, workspaceID: c.req.WorkspaceID, projectID: c.req.ProjectID, config: cfg, logger: c.logger, registry: c.req.Registry}
+		idx := &Indexer{contractHandlerCandidates: evidence.contractHandlerDeclarations, contractRepoWorkspaces: workspaces, contractProviderValue: c.ownedProviderSchema, contractProviderObserved: c.rememberProviderSchema, contractBindingValue: c.ownedBodyBinding, contractBindingObserved: c.rememberBodyBinding, graph: evidence, rootPath: "/contract-followup", repoPrefix: c.snap.Key.RepoPrefix, workspaceID: c.req.WorkspaceID, projectID: c.req.ProjectID, config: cfg, logger: c.logger, registry: c.req.Registry}
 		opts := c.snap.RepoExtractionOptions[c.snap.Key.RepoPrefix]
 		idx.extractionOptions.Store(&opts)
 		idx.contractAnalysisOnly = true

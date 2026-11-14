@@ -89,3 +89,48 @@ func TestContractSchedulerEqualAcceptanceTimesKeepPublicationOrderAndFences(t *t
 		})
 	}
 }
+
+// A request that asks again for the running job's key, after another key
+// came and went, keeps the job's background work; only a different wanted
+// key supersedes it.
+func TestContractSchedulerBackgroundCurrentComparesWantedKey(t *testing.T) {
+	p := newSchedulerProbe(t, nil)
+	jobs := make(chan *contractAnalysisJob, 1)
+	resume := make(chan struct{})
+	defer close(resume)
+	p.c.run = func(job *contractAnalysisJob) string {
+		defer job.snapshot.Release()
+		select {
+		case jobs <- job:
+		case <-p.c.ctx.Done():
+			return viewmetrics.ContractJobPreempted
+		}
+		select {
+		case <-resume:
+		case <-p.c.ctx.Done():
+		}
+		return viewmetrics.ContractJobPreempted
+	}
+	repos := []string{"repo-a", "repo-b"}
+	actor := NewContractActor("", repos)
+	schedule := func(key string) uint64 {
+		t.Helper()
+		result, err := p.c.Schedule(t.Context(), ContractScheduleRequest{Actor: actor, Key: graph.ContractAttachmentKey{RepoPrefix: "repo-a"}, Inputs: schedulerInputs(repos, key), Epoch: p.c.InputEpoch()})
+		require.NoError(t, err)
+		return result.ArrivalSeq
+	}
+	first := schedule("first")
+	var job *contractAnalysisJob
+	select {
+	case job = <-jobs:
+	case <-time.After(time.Minute):
+		t.Fatal("scheduler never dispatched")
+	}
+	require.NoError(t, job.backgroundCurrent(t.Context()))
+	schedule("other")
+	again := schedule("first")
+	require.Greater(t, again, first, "the returning key is asked for at a newer seq")
+	require.NoError(t, job.backgroundCurrent(t.Context()), "the running job's key is wanted again")
+	schedule("other")
+	require.ErrorIs(t, job.backgroundCurrent(t.Context()), errContractJobKeyMoved, "a different wanted key supersedes the job")
+}

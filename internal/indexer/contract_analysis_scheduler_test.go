@@ -1059,7 +1059,7 @@ func TestContractSchedulerRegistryEvictsOnlyTheLeastRecentIdleActor(t *testing.T
 	var active, oldestIdle ContractActor
 	for i := 0; i < contractSchedulerMaxActors; i++ {
 		id := NewContractActor(fmt.Sprintf("checkout-%d", i), []string{"r"})
-		a := c.registerLocked(id, base.Add(time.Duration(i)*time.Second))
+		a := c.registerLocked(id, "", base.Add(time.Duration(i)*time.Second))
 		switch i {
 		case 0:
 			active, a.state = id, contractActorRunning
@@ -1075,7 +1075,7 @@ func TestContractSchedulerRegistryEvictsOnlyTheLeastRecentIdleActor(t *testing.T
 	old := c.actors[oldestIdle]
 	changed := old.changed
 	newID := NewContractActor("new", []string{"r"})
-	c.registerLocked(newID, base.Add(time.Hour))
+	c.registerLocked(newID, "", base.Add(time.Hour))
 	require.Len(t, c.actors, contractSchedulerMaxActors)
 	require.Contains(t, c.actors, active, "even the oldest active actor retains custody")
 	require.Contains(t, c.actors, refreshed, "recent use protects an older idle actor from FIFO eviction")

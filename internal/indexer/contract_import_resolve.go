@@ -141,7 +141,10 @@ func (mi *MultiIndexer) disambiguateBareTypesViaImportsPrefetched(
 				if name == "" || strings.Contains(name, "::") {
 					continue
 				}
-				resolved := mi.resolveBareTypeViaImportsPrefetched(src, name, srcCache, importCache, candidatesByName)
+				// Callers hold mi.mu (read).
+				repo := items[i].RepoPrefix
+				visible := func(n *graph.Node) bool { return mi.contractTypeVisibleLocked(n, repo) }
+				resolved := mi.resolveBareTypeViaImportsPrefetched(src, name, srcCache, importCache, candidatesByName, visible)
 				if resolved == "" {
 					continue
 				}
@@ -170,14 +173,16 @@ func (mi *MultiIndexer) resolveBareTypeViaImports(
 	if isRustFile(srcFile) {
 		names = append(names, mi.rustImportCandidateNames(srcFile, name, srcCache)...)
 	}
-	return mi.resolveBareTypeViaImportsPrefetched(srcFile, name, srcCache, importCache, g.FindNodesByNames(names))
+	return mi.resolveBareTypeViaImportsPrefetched(srcFile, name, srcCache, importCache, g.FindNodesByNames(names), nil)
 }
 
+// visible, when set, limits the candidates to those the contract may name.
 func (mi *MultiIndexer) resolveBareTypeViaImportsPrefetched(
 	srcFile, name string,
 	srcCache map[string][]byte,
 	importCache map[string]map[string]string,
 	candidatesByName map[string][]*graph.Node,
+	visible func(*graph.Node) bool,
 ) string {
 	if isRustFile(srcFile) {
 		src := mi.cachedSource(srcFile, srcCache)
@@ -188,7 +193,7 @@ func (mi *MultiIndexer) resolveBareTypeViaImportsPrefetched(
 		if !ok {
 			return ""
 		}
-		return mi.resolveRustUseFactsTargetPrefetched(rustFacts, candidatesByName, srcCache)
+		return mi.resolveRustUseFactsTargetPrefetched(rustFacts, candidatesByName, srcCache, visible)
 	}
 
 	candidates := candidatesByName[name]
@@ -197,7 +202,7 @@ func (mi *MultiIndexer) resolveBareTypeViaImportsPrefetched(
 	}
 	var typed []*graph.Node
 	for _, n := range candidates {
-		if n.Kind == graph.KindType || n.Kind == graph.KindInterface {
+		if (n.Kind == graph.KindType || n.Kind == graph.KindInterface) && (visible == nil || visible(n)) {
 			typed = append(typed, n)
 		}
 	}
@@ -248,6 +253,7 @@ func (mi *MultiIndexer) resolveRustUseFactsTargetPrefetched(
 	facts []rustUseFact,
 	candidatesByName map[string][]*graph.Node,
 	srcCache map[string][]byte,
+	visible func(*graph.Node) bool,
 ) string {
 	seen := map[string]bool{}
 	var hit string
@@ -262,7 +268,7 @@ func (mi *MultiIndexer) resolveRustUseFactsTargetPrefetched(
 					if node == nil || node.FilePath != file || seen[node.ID] {
 						continue
 					}
-					if node.Kind != graph.KindType && node.Kind != graph.KindInterface {
+					if (node.Kind != graph.KindType && node.Kind != graph.KindInterface) || (visible != nil && !visible(node)) {
 						continue
 					}
 					seen[node.ID] = true

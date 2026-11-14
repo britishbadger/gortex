@@ -365,10 +365,13 @@ type Indexer struct {
 	// Job-local owned binding projections are supplied only by the contract
 	// convergence worker. Legacy/ordinary indexing keeps these hooks nil.
 	contractHandlerCandidates func([]string) (map[string][]*graph.Node, bool)
-	contractProviderValue     func(contracts.Contract, []*graph.Node) (map[string]any, bool)
-	contractProviderObserved  func(contracts.Contract, []*graph.Node, map[string]any)
-	contractBindingValue      func(*graph.Node, string) (contracts.Binding, bool)
-	contractBindingObserved   func(*graph.Node, string, contracts.Binding)
+	// contractRepoWorkspaces names each cohort repo's workspace slug in an
+	// analysis job, whose handler declaration rows carry none.
+	contractRepoWorkspaces   map[string]string
+	contractProviderValue    func(contracts.Contract, []*graph.Node) (map[string]any, bool)
+	contractProviderObserved func(contracts.Contract, []*graph.Node, map[string]any)
+	contractBindingValue     func(*graph.Node, string) (contracts.Binding, bool)
+	contractBindingObserved  func(*graph.Node, string, contracts.Binding)
 	// contractRegistrySeed defers immutable-stack hydration until an edit
 	// actually needs the complete repository registry.
 	contractRegistrySeed           func()
@@ -7903,13 +7906,53 @@ func (idx *Indexer) upgradeContractBareTypeRefs(reg *contracts.Registry) {
 				same = append(same, node.ID)
 				continue
 			}
-			others = append(others, node.ID)
+			if idx.contractTypeInWorkspace(node) {
+				others = append(others, node.ID)
+			}
 		}
 		if len(same) > 0 {
 			return same
 		}
 		return others
 	})
+}
+
+// contractTypeInWorkspace reports whether a type defined in another repo
+// may stand for this indexer's contracts: only within their effective
+// workspace (the configured slug, else the repo prefix), the boundary the
+// matcher pairs within.
+func (idx *Indexer) contractTypeInWorkspace(node *graph.Node) bool {
+	want := idx.workspaceID
+	if want == "" {
+		want = idx.repoPrefix
+	}
+	if node.WorkspaceID == "" {
+		if ws := idx.contractRepoWorkspaces[node.RepoPrefix]; ws != "" {
+			return ws == want
+		}
+	}
+	return contractNodeWorkspace(node) == want
+}
+
+// contractHandlerCandidatesInWorkspace keeps the handler candidates of the
+// contract's own repo and of the rest of its workspace, so a namesake in
+// another workspace neither shadows nor makes ambiguous a route's handler.
+func (idx *Indexer) contractHandlerCandidatesInWorkspace(nodes []*graph.Node, repoHint string) []*graph.Node {
+	kept := nodes[:0:0]
+	for _, n := range nodes {
+		if n == nil || n.RepoPrefix == repoHint || (repoHint != "" && strings.HasPrefix(n.ID, repoHint+"/")) || idx.contractTypeInWorkspace(n) {
+			kept = append(kept, n)
+		}
+	}
+	return kept
+}
+
+// contractNodeWorkspace is a node's effective workspace slug.
+func contractNodeWorkspace(node *graph.Node) string {
+	if node.WorkspaceID != "" {
+		return node.WorkspaceID
+	}
+	return node.RepoPrefix
 }
 
 // commitContracts writes contract nodes + provides/consumes edges for
@@ -8533,6 +8576,7 @@ func (idx *Indexer) resolveInnermostHandlerFromCandidates(
 		if byName == nil {
 			classes = idx.graph.FindNodesByName(short)
 		}
+		classes = idx.contractHandlerCandidatesInWorkspace(classes, repoHint)
 		count := 0
 		for _, n := range classes {
 			if n != nil && n.Kind == graph.KindType {
@@ -8571,6 +8615,7 @@ func (idx *Indexer) resolveInnermostHandlerFromCandidates(
 		if byName == nil {
 			nodes = idx.graph.FindNodesByName(name)
 		}
+		nodes = idx.contractHandlerCandidatesInWorkspace(nodes, repoHint)
 		if owner != nil {
 			var owned []*graph.Node
 			for _, n := range nodes {
@@ -9328,7 +9373,7 @@ func (idx *Indexer) upgradeBareTypeNames(keys []contractTypeNameKey) map[contrac
 				fallback = node
 				break
 			}
-			if fallback == nil {
+			if fallback == nil && idx.contractTypeInWorkspace(node) {
 				fallback = node
 			}
 		}

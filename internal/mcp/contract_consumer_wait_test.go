@@ -618,7 +618,7 @@ func TestContractConsumerYieldCountsOrdinaryWorkAndBalancesFailure(t *testing.T)
 		return scheduledAt(1)(ctx, req)
 	}
 	f.srv.SetContractAnalysisRuntime(fake.runtime())
-	_, _, err := f.srv.scheduleAndWaitContractAnalysis(t.Context(), indexer.NewContractActor("", []string{"repo"}), nil, &pendingContractBinding{}, 0)
+	_, _, err := f.srv.scheduleAndWaitContractAnalysis(t.Context(), indexer.NewContractActor("", []string{"repo"}), nil, &pendingContractBinding{}, 0, nil)
 	require.ErrorIs(t, err, context.Canceled)
 	require.Zero(t, f.srv.contractAnalysisWaiters.Load())
 	ctx, cancel := context.WithCancel(t.Context())

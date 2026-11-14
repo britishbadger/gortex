@@ -53,7 +53,7 @@ type ContractAnalysisCoordinatorOptions struct {
 	// without that owner retain full retirement.
 	RetireReservation func(context.Context, *store_sqlite.Store, int64, func(int64) bool) error
 	// QueueCapacity bounds the actors with pending or running work, 1..32;
-	// zero means 8.
+	// zero means 8. The actors of one workspace split count once.
 	QueueCapacity int
 	// MemoryLimitBytes is the installed standing Go memory limit captured before
 	// warmup. It sizes the global retained checkpoint budget, not an actor budget

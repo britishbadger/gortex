@@ -587,6 +587,19 @@ func contractNodeRecordLess(a, b contracts.Contract) bool {
 	}
 }
 
+// ContractNodeRowLess orders two rows written for one contract ID as
+// contractGraphRows orders their records: of several cohorts' rows, the
+// least is the one a single cohort over all their records writes.
+func ContractNodeRowLess(a, b *graph.Node) bool {
+	return contractNodeRecordLess(contractNodeRowRecord(a), contractNodeRowRecord(b))
+}
+
+func contractNodeRowRecord(node *graph.Node) contracts.Contract {
+	symbol, _ := node.Meta["symbol_id"].(string)
+	role, _ := node.Meta["role"].(string)
+	return contracts.Contract{ID: node.ID, FilePath: node.FilePath, SymbolID: symbol, Role: contracts.Role(role), Line: metaInt(node.Meta, "line")}
+}
+
 func contractRegistryKey(contract contracts.Contract) string {
 	return contract.ID + "|" + contract.FilePath + "|" + contract.SymbolID + "|" + string(contract.Role)
 }

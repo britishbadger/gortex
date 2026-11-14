@@ -3,6 +3,7 @@ package indexer
 import (
 	"context"
 	"path/filepath"
+	"slices"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -325,6 +326,33 @@ func (mi *MultiIndexer) ReposInWorkspace(workspaceID string) map[string]bool {
 		}
 	}
 	return out
+}
+
+// RepoWorkspaceGroups splits repos by effective workspace slug, the rule
+// ReposInWorkspace uses. Each group is sorted and deduplicated, and groups
+// are ordered by their first repo.
+func (mi *MultiIndexer) RepoWorkspaceGroups(repos []string) [][]string {
+	if len(repos) == 0 {
+		return nil
+	}
+	sorted := slices.Clone(repos)
+	sort.Strings(sorted)
+	sorted = slices.Compact(sorted)
+	index := make(map[string]int)
+	var groups [][]string
+	mi.mu.RLock()
+	defer mi.mu.RUnlock()
+	for _, repo := range sorted {
+		ws := mi.effectiveWorkspaceLocked(repo)
+		at, ok := index[ws]
+		if !ok {
+			at = len(groups)
+			index[ws] = at
+			groups = append(groups, nil)
+		}
+		groups[at] = append(groups[at], repo)
+	}
+	return groups
 }
 
 // BackfillWorkspaceSlugs walks every node and contract attached to

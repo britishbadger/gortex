@@ -47,7 +47,8 @@ import (
 // contractInterestTTL is how long a request's interest in an actor lasts.
 const contractInterestTTL = 60 * time.Second
 
-// Registry bounds: actors with pending or running work, and actors kept.
+// Registry bounds: actors with pending or running work, and actors kept,
+// counted in admission units (one workspace split counts once).
 const (
 	contractSchedulerCapacity    = 8
 	contractSchedulerMaxCapacity = 32
@@ -153,6 +154,12 @@ type ContractScheduleRequest struct {
 	// For the rest of the caller's budget, at most the interest TTL, the
 	// actor's jobs start and run outside its linked policy.
 	Strict bool
+	// Siblings are the actors of one request split by workspace. Together
+	// they are one admission unit: they take one queue and registry place,
+	// as the single actor over all their repos would, hold it while any has
+	// work or interest, and are evicted only together, once none has. An
+	// actor stays in the first such split until no request wants it.
+	Siblings []ContractActor
 }
 
 // ContractScheduleOutcome is what Schedule did with a request.
@@ -352,9 +359,58 @@ type contractActor struct {
 	lastUsed            time.Time
 	seq                 uint64
 	changed             chan struct{}
+	// split names the workspace split the actor was asked for in; empty when
+	// it was asked for alone. It changes only once no request wants the
+	// split it names (splitWantedLocked).
+	split string
+}
+
+// contractAdmissionUnit is what admission and eviction count: an actor, or
+// every actor of one workspace split.
+type contractAdmissionUnit struct {
+	split string
+	actor ContractActor
+}
+
+func (a *contractActor) unit() contractAdmissionUnit {
+	if a.split != "" {
+		return contractAdmissionUnit{split: a.split}
+	}
+	return contractAdmissionUnit{actor: a.id}
+}
+
+// contractSplitKey names a request's workspace split by its sorted actors.
+func contractSplitKey(siblings []ContractActor) string {
+	if len(siblings) < 2 {
+		return ""
+	}
+	keys := make([]string, 0, len(siblings))
+	for _, sibling := range siblings {
+		keys = append(keys, sibling.Checkout+"\x01"+sibling.cohort)
+	}
+	sort.Strings(keys)
+	return strings.Join(slices.Compact(keys), "\x02")
 }
 
 func (a *contractActor) primary() bool { return a.id.Checkout == "" }
+
+// wanted reports whether the actor has work or a request's interest at now.
+func (a *contractActor) wanted(now time.Time) bool {
+	return a.hasWork() || a.interestUntil.After(now)
+}
+
+// splitWantedLocked reports whether any actor of split is wanted at now.
+func (c *ContractAnalysisCoordinator) splitWantedLocked(split string, now time.Time) bool {
+	if split == "" {
+		return false
+	}
+	for _, a := range c.actors {
+		if a.split == split && a.wanted(now) {
+			return true
+		}
+	}
+	return false
+}
 
 // hasWork reports whether the actor holds scheduler capacity.
 func (a *contractActor) hasWork() bool { return a.state != contractActorIdle }
@@ -553,18 +609,27 @@ func (c *ContractAnalysisCoordinator) Schedule(ctx context.Context, req Contract
 		result.Result, result.ArrivalSeq = ContractNoop, a.lastPublished.seq
 		return result, nil
 	}
+	split := contractSplitKey(req.Siblings)
 	if a == nil {
 		// A linked actor the idle policy holds pins no source, slot or
 		// lease and may wait out a long busy spell: it takes no queue
 		// capacity, so a worktree opened under load still records its
-		// interest. Held actors count against the registry instead.
-		if active, held := c.activeLocked(now); active-held >= c.options.QueueCapacity || active >= contractSchedulerMaxActors {
+		// interest. Held actors count against the registry instead. A
+		// sibling joining its split's unit takes no new place.
+		load := c.admissionLocked(now, split)
+		if (load.queued >= c.options.QueueCapacity && !load.joinsQueued) || (load.active >= contractSchedulerMaxActors && !load.joinsActive) {
 			// A known actor is never refused; a new one is, and asks again
 			// once a job's time has passed.
 			label = viewmetrics.ContractRequestQueueFull
 			return result, &ContractQueueFullError{RetryAfter: c.retryAfterLocked()}
 		}
-		a = c.registerLocked(req.Actor, now)
+		a = c.registerLocked(req.Actor, split, now)
+	}
+	if a.split != split && !c.splitWantedLocked(a.split, now) {
+		// An actor stays in a split a request still wants, whatever another
+		// request asks it for alone or with other groups: the split keeps one
+		// place and is evicted whole.
+		a.split = split
 	}
 	a.interestUntil, a.lastUsed = now.Add(contractInterestTTL), now
 	if req.Strict {
@@ -637,25 +702,52 @@ func (c *ContractAnalysisCoordinator) Schedule(ctx context.Context, req Contract
 	return result, nil
 }
 
-// registerLocked adds an actor, evicting the least recently used idle actor
-// when the registry is full.
-func (c *ContractAnalysisCoordinator) registerLocked(id ContractActor, now time.Time) *contractActor {
-	if len(c.actors) >= contractSchedulerMaxActors {
-		var victim *contractActor
-		for _, candidate := range c.actors {
-			if candidate.hasWork() {
+// registerLocked adds an actor, evicting least recently used idle units
+// while the registry is full. A unit any of whose actors has work or a
+// request's interest is never evicted: the registry may exceed its bound
+// until that interest ends. An actor joining its split's unit takes no new
+// place.
+func (c *ContractAnalysisCoordinator) registerLocked(id ContractActor, split string, now time.Time) *contractActor {
+	type unitState struct {
+		members  []*contractActor
+		busy     bool
+		lastUsed time.Time
+	}
+	units := make(map[contractAdmissionUnit]*unitState)
+	for _, candidate := range c.actors {
+		unit := units[candidate.unit()]
+		if unit == nil {
+			unit = &unitState{}
+			units[candidate.unit()] = unit
+		}
+		unit.members = append(unit.members, candidate)
+		unit.busy = unit.busy || candidate.wanted(now)
+		if candidate.lastUsed.After(unit.lastUsed) {
+			unit.lastUsed = candidate.lastUsed
+		}
+	}
+	_, joins := units[contractAdmissionUnit{split: split}]
+	for !(split != "" && joins) && len(units) >= contractSchedulerMaxActors {
+		var victimKey contractAdmissionUnit
+		var victim *unitState
+		for key, unit := range units {
+			if unit.busy {
 				continue
 			}
-			if victim == nil || candidate.lastUsed.Before(victim.lastUsed) {
-				victim = candidate
+			if victim == nil || unit.lastUsed.Before(victim.lastUsed) {
+				victimKey, victim = key, unit
 			}
 		}
-		if victim != nil {
-			c.deltaCaches.put(victim.id, nil)
+		if victim == nil {
+			break
+		}
+		delete(units, victimKey)
+		for _, member := range victim.members {
+			c.deltaCaches.put(member.id, nil)
 			c.deltaRegistryEvictions++
-			delete(c.actors, victim.id)
-			victim.ring.actors = slices.DeleteFunc(victim.ring.actors, func(a *contractActor) bool { return a == victim })
-			victim.notifyLocked()
+			delete(c.actors, member.id)
+			member.ring.actors = slices.DeleteFunc(member.ring.actors, func(a *contractActor) bool { return a == member })
+			member.notifyLocked()
 		}
 	}
 	repos := id.Repos()
@@ -666,25 +758,44 @@ func (c *ContractAnalysisCoordinator) registerLocked(id ContractActor, now time.
 		c.workers.Add(1)
 		go c.dispatch(ring)
 	}
-	a := &contractActor{id: id, repos: repos, ring: ring, lastUsed: now, changed: make(chan struct{})}
+	a := &contractActor{id: id, repos: repos, ring: ring, lastUsed: now, changed: make(chan struct{}), split: split}
 	c.actors[id] = a
 	ring.actors = append(ring.actors, a)
 	return a
 }
 
-// activeLocked counts actors with pending or running work and, of those, the
-// queued ones the idle policy holds at now.
-func (c *ContractAnalysisCoordinator) activeLocked(now time.Time) (active, held int) {
+// contractAdmissionLoad is the scheduler's load in admission units: active
+// units have pending or running work, queued ones work the idle policy does
+// not hold at now. A split counts while any of its actors is wanted, so a
+// group that finished keeps the place for siblings not yet asked for. The
+// joins fields report that a split already counts.
+type contractAdmissionLoad struct {
+	active, queued           int
+	joinsActive, joinsQueued bool
+}
+
+func (c *ContractAnalysisCoordinator) admissionLocked(now time.Time, split string) contractAdmissionLoad {
+	active := make(map[contractAdmissionUnit]bool)
 	for _, a := range c.actors {
-		if !a.hasWork() {
-			continue
-		}
-		active++
-		if a.state == contractActorQueued && c.idleHeldLocked(a, now) {
-			held++
+		switch {
+		case a.hasWork():
+			queued := !(a.state == contractActorQueued && c.idleHeldLocked(a, now))
+			active[a.unit()] = active[a.unit()] || queued
+		case a.split != "" && a.interestUntil.After(now):
+			active[a.unit()] = active[a.unit()] || !c.idleHeldLocked(a, now)
 		}
 	}
-	return active, held
+	var load contractAdmissionLoad
+	for unit, queued := range active {
+		load.active++
+		if queued {
+			load.queued++
+		}
+		if split != "" && unit.split == split {
+			load.joinsActive, load.joinsQueued = true, queued
+		}
+	}
+	return load
 }
 
 // retryAfterLocked is when a refused request should ask again: the mean job
@@ -1602,7 +1713,8 @@ func (c *ContractAnalysisCoordinator) runActor(a *contractActor, want contractAc
 			return err
 		}
 		c.mu.Lock()
-		newer := a.want.seq > want.seq
+		// A newer seq at the job's own key still wants this job's output.
+		moved := a.want.seq > want.seq && a.want.key != want.key
 		changed := false
 		for _, repo := range a.repos {
 			changed = changed || c.acceptedEpoch[repo] != checkedAccepted[repo]
@@ -1615,7 +1727,7 @@ func (c *ContractAnalysisCoordinator) runActor(a *contractActor, want contractAc
 			}
 		}
 		c.mu.Unlock()
-		if newer {
+		if moved {
 			return errContractJobKeyMoved
 		}
 		// A cheap relevant-repo notification triggers one full input fence.

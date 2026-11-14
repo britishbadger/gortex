@@ -9,6 +9,7 @@ import (
 	"github.com/zzet/gortex/internal/contracts"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/graphview"
+	"github.com/zzet/gortex/internal/indexer"
 	"github.com/zzet/gortex/internal/query"
 )
 
@@ -40,6 +41,9 @@ type contractAnalysisContext struct {
 	// registries reuses unchanged repository loads across requests; nil
 	// loads every repository.
 	registries *contractRegistryCache
+	// cohortOf names each view's workspace group when a request was split
+	// by workspace; nil when every view is of one cohort.
+	cohortOf map[string]int
 }
 
 func withContractAnalysisContext(ctx context.Context, binding *contractAnalysisContext) context.Context {
@@ -103,10 +107,25 @@ func (binding *contractAnalysisContext) readError() error {
 // Every repo payload participating in a match or bridge must have consulted
 // the same selected companion inputs. Independent latest attachments are not
 // a coherent cross-repository snapshot, even when their canonical IDs match.
+// A request split by workspace holds this within each group: no match or
+// bridge spans two workspaces.
 func (binding *contractAnalysisContext) checkCohort() error {
+	groups := make(map[int][]*graphview.ContractAnalysisView)
+	for repo, view := range binding.views {
+		groups[binding.cohortOf[repo]] = append(groups[binding.cohortOf[repo]], view)
+	}
+	for _, views := range groups {
+		if err := checkCohortInputs(views); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func checkCohortInputs(views []*graphview.ContractAnalysisView) error {
 	var version, fingerprint string
-	for _, view := range binding.views {
-		if len(binding.views) <= 1 {
+	for _, view := range views {
+		if len(views) <= 1 {
 			return nil
 		}
 		if view == nil || view.Attachment.InputVersion == "" || view.Attachment.InputFingerprint == "" {
@@ -273,8 +292,13 @@ func (binding *contractAnalysisContext) shapeLookup(ctx context.Context) contrac
 }
 
 func (binding *contractAnalysisContext) analysisNodes(ctx context.Context, kinds []graph.NodeKind) ([]*graph.Node, error) {
-	byID := make(map[string]*graph.Node)
-	for _, view := range binding.views {
+	ambiguous := func() error {
+		err := graphview.NewViewError(graphview.CodeRequiredCapabilityIncomplete, "contract node identity is ambiguous across selected analyses")
+		binding.recordReadError(err)
+		return err
+	}
+	groups := make(map[int]map[string]*graph.Node)
+	for repo, view := range binding.views {
 		var nodes []*graph.Node
 		var err error
 		if kinds == nil {
@@ -286,13 +310,40 @@ func (binding *contractAnalysisContext) analysisNodes(ctx context.Context, kinds
 			binding.recordReadError(err)
 			return nil, err
 		}
+		group := groups[binding.cohortOf[repo]]
+		if group == nil {
+			group = make(map[string]*graph.Node)
+			groups[binding.cohortOf[repo]] = group
+		}
 		for _, node := range nodes {
-			if old := byID[node.ID]; old != nil && !reflect.DeepEqual(old, node) {
-				err := graphview.NewViewError(graphview.CodeRequiredCapabilityIncomplete, "contract node identity is ambiguous across selected analyses")
-				binding.recordReadError(err)
-				return nil, err
+			if old := group[node.ID]; old != nil && !reflect.DeepEqual(old, node) {
+				return nil, ambiguous()
 			}
-			byID[node.ID] = node
+			group[node.ID] = node
+		}
+	}
+	// Workspace groups each write a contract ID's row from their own records;
+	// the row a single cohort writes is the one whose record sorts first.
+	order := make([]int, 0, len(groups))
+	for group := range groups {
+		order = append(order, group)
+	}
+	sort.Ints(order)
+	byID := make(map[string]*graph.Node)
+	for _, group := range order {
+		for id, node := range groups[group] {
+			old := byID[id]
+			switch {
+			case old == nil:
+				byID[id] = node
+			case reflect.DeepEqual(old, node):
+			case old.Kind == graph.KindContract && node.Kind == graph.KindContract:
+				if indexer.ContractNodeRowLess(node, old) {
+					byID[id] = node
+				}
+			default:
+				return nil, ambiguous()
+			}
 		}
 	}
 	ids := make([]string, 0, len(byID))

@@ -11,7 +11,9 @@ import (
 // ReconcileContractEdgesForFrontier is the precise incremental sibling of the
 // existing full cold reconciliation path.
 func (mi *MultiIndexer) ReconcileContractEdgesForFrontier(plan DerivedInvalidationPlan) int {
-	if mi.contractCoreRuntime.Load() != nil { return 0 }
+	if mi.contractCoreRuntime.Load() != nil {
+		return 0
+	}
 	if len(plan.ContractGroups) == 0 && len(plan.ContractSymbolIDs) == 0 {
 		return mi.ReconcileContractEdges()
 	}
@@ -230,13 +232,25 @@ func (mi *MultiIndexer) persistScopedInlinedContracts(inlined []contracts.Contra
 	if len(registries) == 0 {
 		return
 	}
-	names := sortedStringKeys(bareTypeNames)
-	matchesByName := mi.graph.FindNodesByNames(names)
-	lookup := func(name, repoHint string) []string {
+	lookup := mi.contractTypeLookupLocked(mi.graph.FindNodesByNames(sortedStringKeys(bareTypeNames)))
+	for _, registry := range registries {
+		registry.UpgradeBareTypeRefs(lookup)
+	}
+	mi.disambiguateBareTypesViaImportsBatch(registries, mi.graph)
+	for _, registry := range registries {
+		mi.attachInlinedShapes(registry, mi.graph)
+	}
+}
+
+// contractTypeLookupLocked is the bare type lookup of inlined contracts: the
+// type and interface candidates a contract of repoHint may name, its own
+// repo's first. Caller holds mi.mu (read).
+func (mi *MultiIndexer) contractTypeLookupLocked(matchesByName map[string][]*graph.Node) func(name, repoHint string) []string {
+	return func(name, repoHint string) []string {
 		matches := matchesByName[name]
 		ids := make([]string, 0, len(matches))
 		for _, node := range matches {
-			if node.Kind == graph.KindType || node.Kind == graph.KindInterface {
+			if (node.Kind == graph.KindType || node.Kind == graph.KindInterface) && mi.contractTypeVisibleLocked(node, repoHint) {
 				ids = append(ids, node.ID)
 			}
 		}
@@ -254,13 +268,20 @@ func (mi *MultiIndexer) persistScopedInlinedContracts(inlined []contracts.Contra
 		}
 		return ids
 	}
-	for _, registry := range registries {
-		registry.UpgradeBareTypeRefs(lookup)
+}
+
+// contractTypeVisibleLocked reports whether a contract of repo may name the
+// type node: its own repo's, or one in the same effective workspace, as
+// Indexer.contractTypeInWorkspace. Caller holds mi.mu (read).
+func (mi *MultiIndexer) contractTypeVisibleLocked(node *graph.Node, repo string) bool {
+	if repo == "" || node.RepoPrefix == repo || strings.HasPrefix(node.ID, repo+"/") {
+		return true
 	}
-	mi.disambiguateBareTypesViaImportsBatch(registries, mi.graph)
-	for _, registry := range registries {
-		mi.attachInlinedShapes(registry, mi.graph)
+	ws := node.WorkspaceID
+	if ws == "" {
+		ws = mi.effectiveWorkspaceLocked(node.RepoPrefix)
 	}
+	return ws == mi.effectiveWorkspaceLocked(repo)
 }
 
 func contractLinkTouchesFrontier(link contracts.CrossLink, groups map[string]struct{}, symbols map[string]struct{}) bool {
