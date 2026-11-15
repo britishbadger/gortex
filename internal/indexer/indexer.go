@@ -573,6 +573,19 @@ type Indexer struct {
 	// reflects work this run performed.
 	fullReindexed atomic.Bool
 
+	// resumeUntrusted is raised with fullReindexed, and whenever a file's
+	// per-file ledger marker is written false after in-place enrichment
+	// (setReparsePendingEnrichments), and is consumed by the next whole-repo
+	// deferred pass. That pass must not resume a type pass from a point
+	// recorded before the re-parse or the in-place enrichment (it discards it
+	// at open; after a whole-repo re-parse the repo eviction already deleted
+	// the persisted row), but points it records itself are recorded over the
+	// current graph, so a later pass in this run may resume them.
+	// fullReindexed itself stays raised: it is also what forces the pass past
+	// a completion marker the re-parse invalidated, and a cut first pass
+	// writes no new marker.
+	resumeUntrusted atomic.Bool
+
 	// reparsedThisRun is the scoped analogue of fullReindexed: it is raised by a
 	// scoped incremental pass that re-parsed at least one stale file this run —
 	// IncrementalReindexPaths with a non-zero
@@ -1462,7 +1475,26 @@ func (idx *Indexer) runDeferredEnrich() {
 	// the freshly-unstamped nodes, so a scoped force stays bounded to those files.
 	opts := semantic.EnrichOptions{
 		RepoState: map[string]semantic.RepoEnrichState{
-			idx.repoPrefix: {SHA: sha, Dirty: dirty, Force: idx.fullReindexed.Load() || idx.reparsedThisRun.Load()},
+			idx.repoPrefix: {
+				SHA: sha, Dirty: dirty,
+				Force: idx.fullReindexed.Load() || idx.reparsedThisRun.Load(),
+				// A scoped re-parse either stamps its file on the per-file
+				// ledger, which no earlier point covers, or re-enriches it
+				// in place and clears the marker, which raises the latch
+				// (setReparsePendingEnrichments): in-place enrichment does
+				// not restore the edges importers' type facts point into the
+				// file, and the ledger no longer names it. A whole-repo
+				// re-parse raises the latch too. Either way the latched pass
+				// starts from the first page. Consuming the latch here is safe
+				// only because every repo-scoped eviction a whole-repo
+				// re-parse goes through deletes the repo's enrichment_resume
+				// rows itself (store_sqlite file_batch_evict.go, in the
+				// eviction transaction; shadow_repo_evict.go, in a step that
+				// completes before the replacement rows are written): no
+				// point from before the re-parse survives for a later pass in
+				// this run to resume.
+				ReparsedFilesMarked: !idx.resumeUntrusted.Swap(false),
+			},
 		},
 		MinLanguageNodes: semantic.EnrichmentAdmissionFloor(),
 		ApplyGate:        idx.deferredApplyGate,
@@ -4954,6 +4986,7 @@ func (idx *Indexer) indexCtxRaw(ctx context.Context, root string) (result *Index
 		// edges — force the deferred pass past the completion-marker gate so
 		// they are restored even at an unchanged clean HEAD.
 		idx.fullReindexed.Store(true)
+		idx.resumeUntrusted.Store(true)
 	}
 	return result, nil
 }
@@ -5341,6 +5374,10 @@ func (idx *Indexer) indexFile(
 			n := sizeSkipNode(skippedFile{
 				relPath: relPath, lang: lang, size: int64(len(src)),
 			}, maxSize)
+			if err := idx.discardResumeBeforeSkipEviction(priorNodes); err != nil {
+				return err
+			}
+			stampSkipEpoch([]*graph.Node{n})
 			idx.applyRepoPrefix([]*graph.Node{n}, nil)
 			if journal := idx.contractCoreInputs; journal != nil {
 				if err := journal.prepare(journal.ctx, idx, graphPath, lang, src, nil, false); err != nil {
@@ -5365,6 +5402,10 @@ func (idx *Indexer) indexFile(
 			n := contentSkipNode(skippedFile{
 				relPath: relPath, lang: lang, size: int64(len(src)), reason: reason,
 			})
+			if err := idx.discardResumeBeforeSkipEviction(priorNodes); err != nil {
+				return err
+			}
+			stampSkipEpoch([]*graph.Node{n})
 			idx.applyRepoPrefix([]*graph.Node{n}, nil)
 			if journal := idx.contractCoreInputs; journal != nil {
 				if err := journal.prepare(journal.ctx, idx, graphPath, lang, src, nil, false); err != nil {
@@ -5427,7 +5468,14 @@ func (idx *Indexer) indexFile(
 		}
 		return err
 	}
-	if !skipped {
+	if skipped {
+		// A binary, minified or timed-out parse replaces the file's facts
+		// with a synthetic node, as the size and content skips above do.
+		if err := idx.discardResumeBeforeSkipEviction(priorNodes); err != nil {
+			return err
+		}
+		stampSkipEpoch(result.Nodes)
+	} else {
 		fallbackObservation.next(patchApply)
 	}
 	omitSecondarySourceScans := extractionDispositionFor(result).omitSecondarySourceScans()
@@ -5479,6 +5527,7 @@ func (idx *Indexer) indexFile(
 			return err
 		}
 	}
+	idx.retractUnchangedMtimeReceipts(map[string]fileReadVersion{mtimeKey: readVersion})
 	evictExisting(result)
 
 	// Coverage extractors (todos, licenses, ownership). A prepared watcher
@@ -5531,6 +5580,12 @@ func (idx *Indexer) indexFile(
 	// the node.
 	idx.replaceContentSections(graphPath, result.Nodes, false)
 
+	// The paths below that write the ledger marker find it already set
+	// when enrichment does not run in place.
+	ledgerStamped := !skipped && (resolve || deferredResolverCatchup) && idx.reparseLedgerApplies(result)
+	if ledgerStamped {
+		stampReparseLedger(result.Nodes)
+	}
 	idx.graph.AddBatch(result.Nodes, append(result.Edges, legacyCarried...))
 	idx.persistFileMeta(relPath, src, result)
 	idx.persistConstValues(result)
@@ -5687,9 +5742,12 @@ func (idx *Indexer) indexFile(
 			// is diagnosable rather than silently dropped. Cleared when
 			// enrichment did re-run for the file.
 			pendingReparseEnrichment := providersPresent && !omitSecondarySourceScans && !reEnriched
-			if markerBatch == nil {
+			switch {
+			case pendingReparseEnrichment && ledgerStamped:
+				// Stamped in the fact write above.
+			case markerBatch == nil:
 				idx.setReparsePendingEnrichment(graphPath, pendingReparseEnrichment)
-			} else if markerBatch.add(graphPath, pendingReparseEnrichment) {
+			case markerBatch.add(graphPath, pendingReparseEnrichment):
 				idx.flushReparsePendingEnrichment(markerBatch)
 			}
 		}
@@ -5703,8 +5761,8 @@ func (idx *Indexer) indexFile(
 			result:    result,
 			abSnap:    abSnap,
 		}}))
-		providersPresent := idx.semanticMgr != nil && idx.semanticMgr.Enabled() && idx.semanticMgr.HasProviders()
-		if markerBatch.add(graphPath, providersPresent && !omitSecondarySourceScans) {
+		// Stamped in the fact write above when the file has a type tier.
+		if !ledgerStamped && markerBatch.add(graphPath, false) {
 			idx.flushReparsePendingEnrichment(markerBatch)
 		}
 		// A global-using change re-prices unit-wide dependents even on
@@ -6016,8 +6074,13 @@ func (idx *Indexer) reresolveFileScopedRaw(filePath string) error {
 	if len(idx.graph.GetFileNodes(graphPath)) == 0 {
 		return nil // file gone / evicted; nothing to re-resolve
 	}
-	idx.resolver.ResolveFileAndIncoming(graphPath)
 	providersPresent := idx.semanticMgr != nil && idx.semanticMgr.Enabled() && idx.semanticMgr.HasProviders()
+	if providersPresent {
+		// On the ledger before the re-resolve rewrites any edge, as a
+		// re-parse's fact write puts it there.
+		idx.setReparsePendingEnrichment(graphPath, true)
+	}
+	idx.resolver.ResolveFileAndIncoming(graphPath)
 	watchEnrichment := providersPresent && idx.semanticMgr.EnrichesOnWatch()
 	reEnriched := false
 	if watchEnrichment {
@@ -6030,7 +6093,10 @@ func (idx *Indexer) reresolveFileScopedRaw(filePath string) error {
 	}
 	// Keep the find_usages staleness marker consistent with the enrichment
 	// that actually ran during this forced re-resolve (mirrors indexFile).
-	idx.setReparsePendingEnrichment(graphPath, providersPresent && !reEnriched)
+	// A pending marker was written above.
+	if !providersPresent || reEnriched {
+		idx.setReparsePendingEnrichment(graphPath, false)
+	}
 	return nil
 }
 
@@ -7106,6 +7172,7 @@ func (idx *Indexer) IncrementalReindexPaths(root string, paths []string) (*Index
 // owns an explicit filesystem receipt. Reconcile, storm, and discovery callers
 // retain their historical mtime/Merkle filtering.
 type incrementalPathMode struct {
+	pointPreparation          *watcherPointPreparation // single-use checked built-in parse, never a mutation authority
 	detectDeletions           bool
 	forceExplicitFiles        bool
 	surfaceFirstVersionChange bool
@@ -7113,9 +7180,10 @@ type incrementalPathMode struct {
 	// publication carries only a canonical point attempt's local collector.
 	// Existing batch/reconcile/direct callers leave it nil. No live receipt or
 	// mutable Indexer tracing state is installed by this per-call observation.
-	publication *PublicationStamps
-	readRepair  *ReadRepairObservation
-	onRelations func() // resolver and file publication complete, before derived work
+	publication   *PublicationStamps
+	readRepair    *ReadRepairObservation
+	relationsRead *relationsReadFrontier // optional point-only validated read coverage
+	onRelations   func()                 // resolver and file publication complete, before derived work
 }
 
 // indexedFilesAbsentFromDisk returns the repo-relative keys of files the graph
